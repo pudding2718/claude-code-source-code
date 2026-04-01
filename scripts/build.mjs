@@ -19,7 +19,7 @@
  */
 
 import { readdir, readFile, writeFile, mkdir, cp, rm, stat } from 'node:fs/promises'
-import { join, dirname } from 'node:path'
+import { join, dirname, basename, extname, resolve as resolvePath } from 'node:path'
 import { execSync } from 'node:child_process'
 import { fileURLToPath } from 'node:url'
 
@@ -28,6 +28,21 @@ const ROOT = join(__dirname, '..')
 const VERSION = '2.1.88'
 const BUILD = join(ROOT, 'build-src')
 const ENTRY = join(BUILD, 'entry.ts')
+const COPY_DIRS = [
+  'src',
+  'stubs',
+  'types',
+  'tools',
+  'utils',
+  'assistant',
+  'bridge',
+  'coordinator',
+  'proactive',
+  'services',
+  'tasks',
+  'skills',
+  'vendor',
+]
 
 // ── Helpers ────────────────────────────────────────────────────────────────
 
@@ -40,6 +55,63 @@ async function* walk(dir) {
 }
 
 async function exists(p) { try { await stat(p); return true } catch { return false } }
+
+function toPosix(p) {
+  return p.replaceAll('\\', '/')
+}
+
+function makeStubSource(mod) {
+  const base = basename(mod).replace(/\.[^.]+$/, '') || 'stub'
+  const safeName = base.replace(/[^a-zA-Z0-9_$]/g, '_')
+  return `// Auto-generated stub for ${mod}\nexport default undefined\nexport const ${safeName} = undefined\n`
+}
+
+function resolveBareModuleStubTarget(mod) {
+  const parts = mod.split('/')
+  if (mod.startsWith('@') && parts.length >= 2) {
+    const [scope, name, ...rest] = parts
+    if (rest.length === 0) {
+      return join(BUILD, 'node_modules', scope, name, 'index.js')
+    }
+    return join(BUILD, 'node_modules', scope, name, ...rest)
+  }
+
+  const [name, ...rest] = parts
+  if (rest.length === 0) {
+    return join(BUILD, 'node_modules', name, 'index.js')
+  }
+  return join(BUILD, 'node_modules', name, ...rest)
+}
+
+function relativeStubImport(file, stubName) {
+  const rel = toPosix(dirname(file).replace(`${toPosix(BUILD)}/`, ''))
+  const up = rel ? '../'.repeat(rel.split('/').length) : ''
+  return `${up}stubs/${stubName}`
+}
+
+function parseMissingImports(esbuildOutput) {
+  const lines = esbuildOutput.split('\n')
+  const missing = []
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i]
+    const match = line.match(/Could not resolve "([^"]+)"/)
+    if (!match) continue
+
+    let importer = null
+    for (let j = i + 1; j < Math.min(lines.length, i + 6); j++) {
+      const importerMatch = lines[j].match(/^\s+(.+?):\d+:\d+:/)
+      if (importerMatch) {
+        importer = importerMatch[1]
+        break
+      }
+    }
+
+    missing.push({ mod: match[1], importer })
+  }
+
+  return missing
+}
 
 async function ensureEsbuild() {
   try { execSync('npx esbuild --version', { stdio: 'pipe' }) }
@@ -55,8 +127,36 @@ async function ensureEsbuild() {
 
 await rm(BUILD, { recursive: true, force: true })
 await mkdir(BUILD, { recursive: true })
-await cp(join(ROOT, 'src'), join(BUILD, 'src'), { recursive: true })
-console.log('✅ Phase 1: Copied src/ → build-src/')
+for (const dir of COPY_DIRS) {
+  const from = join(ROOT, dir)
+  const to = join(BUILD, dir)
+  if (await exists(from)) {
+    await cp(from, to, { recursive: true })
+  }
+}
+await writeFile(join(BUILD, 'tsconfig.json'), JSON.stringify({
+  compilerOptions: {
+    target: 'ES2022',
+    module: 'ESNext',
+    moduleResolution: 'bundler',
+    esModuleInterop: true,
+    allowSyntheticDefaultImports: true,
+    strict: false,
+    skipLibCheck: true,
+    forceConsistentCasingInFileNames: true,
+    resolveJsonModule: true,
+    jsx: 'react-jsx',
+    baseUrl: '.',
+    paths: {
+      'bun:bundle': ['stubs/bun-bundle.ts'],
+      'src/*': ['src/*'],
+    },
+    types: ['node'],
+    lib: ['ES2022', 'DOM'],
+  },
+  include: ['src/**/*', 'stubs/**/*', 'tools/**/*', 'types/**/*', 'utils/**/*'],
+}, null, 2))
+console.log(`✅ Phase 1: Copied ${COPY_DIRS.join(', ')} → build-src/`)
 
 // ══════════════════════════════════════════════════════════════════════════════
 // PHASE 2: Transform source
@@ -77,15 +177,15 @@ const MACROS = {
   'MACRO.VERSION_CHANGELOG': `''`,
 }
 
-for await (const file of walk(join(BUILD, 'src'))) {
+for await (const file of walk(BUILD)) {
   if (!file.match(/\.[tj]sx?$/)) continue
 
   let src = await readFile(file, 'utf8')
   let changed = false
 
   // 2a. feature('X') → false
-  if (/\bfeature\s*\(\s*['"][A-Z_]+['"]\s*\)/.test(src)) {
-    src = src.replace(/\bfeature\s*\(\s*['"][A-Z_]+['"]\s*\)/g, 'false')
+  if (/\bfeature\s*\(\s*['"][^'"]+['"]\s*,?\s*\)/.test(src)) {
+    src = src.replace(/\bfeature\s*\(\s*['"][^'"]+['"]\s*,?\s*\)/g, 'false')
     changed = true
   }
 
@@ -97,16 +197,41 @@ for await (const file of walk(join(BUILD, 'src'))) {
     }
   }
 
-  // 2c. Remove bun:bundle import (feature() is already replaced)
-  if (src.includes("from 'bun:bundle'") || src.includes('from "bun:bundle"')) {
-    src = src.replace(/import\s*\{\s*feature\s*\}\s*from\s*['"]bun:bundle['"];?\n?/g, '// feature() replaced with false at build time\n')
+  // 2c. Remove feature() imports after inlining all feature gates
+  if (src.includes('feature } from') || src.includes('feature} from')) {
+    src = src.replace(/import\s*\{\s*feature\s*\}\s*from\s*['"][^'"]*(?:bun:bundle|stubs\/bun-bundle\.js)['"];?\n?/g, '// feature() replaced with false at build time\n')
     changed = true
   }
 
   // 2d. Remove type-only import of global.d.ts
-  if (src.includes("import '../global.d.ts'") || src.includes("import './global.d.ts'")) {
-    src = src.replace(/import\s*['"][.\/]*global\.d\.ts['"];?\n?/g, '')
+  if (src.includes('global.d.ts')) {
+    src = src.replace(/import\s*['"][^'"]*global\.d\.ts['"];?\n?/g, '')
     changed = true
+  }
+
+  // 2e. Normalize import.meta.url for the CommonJS bundle
+  if (src.includes('import.meta.url')) {
+    src = src.replaceAll('import.meta.url', 'globalThis.__cc_import_meta_url')
+    changed = true
+  }
+
+  // 2f. Rewrite private/native packages to local stubs
+  const antStubReplacements = {
+    '@ant/claude-for-chrome-mcp': relativeStubImport(file, 'claude-for-chrome-mcp.js'),
+    '@ant/computer-use-mcp': relativeStubImport(file, 'computer-use-mcp.js'),
+    '@ant/computer-use-mcp/types': relativeStubImport(file, 'computer-use-mcp-types.js'),
+    '@ant/computer-use-mcp/sentinelApps': relativeStubImport(file, 'computer-use-mcp-sentinelApps.js'),
+    '@ant/computer-use-input': relativeStubImport(file, 'computer-use-input.js'),
+    '@ant/computer-use-swift': relativeStubImport(file, 'computer-use-swift.js'),
+    'color-diff-napi': relativeStubImport(file, 'color-diff-napi.js'),
+    'image-processor-napi': relativeStubImport(file, 'image-processor-napi.js'),
+    'modifiers-napi': relativeStubImport(file, 'modifiers-napi.js'),
+  }
+  for (const [from, to] of Object.entries(antStubReplacements)) {
+    if (src.includes(from)) {
+      src = src.replaceAll(from, to)
+      changed = true
+    }
   }
 
   if (changed) {
@@ -120,8 +245,7 @@ console.log(`✅ Phase 2: Transformed ${transformCount} files`)
 // PHASE 3: Create entry wrapper
 // ══════════════════════════════════════════════════════════════════════════════
 
-await writeFile(ENTRY, `#!/usr/bin/env node
-// Claude Code v${VERSION} — built from source
+await writeFile(ENTRY, `// Claude Code v${VERSION} — built from source
 // Copyright (c) Anthropic PBC. All rights reserved.
 import './src/entrypoints/cli.tsx'
 `, 'utf8')
@@ -136,6 +260,7 @@ await ensureEsbuild()
 const OUT_DIR = join(ROOT, 'dist')
 await mkdir(OUT_DIR, { recursive: true })
 const OUT_FILE = join(OUT_DIR, 'cli.js')
+await writeFile(join(OUT_DIR, 'package.json'), JSON.stringify({ type: 'commonjs' }, null, 2))
 
 // Run up to 5 rounds of: esbuild → collect missing → create stubs → retry
 const MAX_ROUNDS = 5
@@ -148,21 +273,23 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
   try {
     esbuildOutput = execSync([
       'npx esbuild',
-      `"${ENTRY}"`,
+      `"${toPosix(ENTRY)}"`,
       '--bundle',
       '--platform=node',
       '--target=node18',
-      '--format=esm',
+      '--format=cjs',
+      '--tsconfig=tsconfig.json',
       `--outfile="${OUT_FILE}"`,
-      `--banner:js=$'#!/usr/bin/env node\\n// Claude Code v${VERSION} (built from source)\\n// Copyright (c) Anthropic PBC. All rights reserved.\\n'`,
-      '--packages=external',
+      `--banner:js=$'#!/usr/bin/env node\\n// Claude Code v${VERSION} (built from source)\\n// Copyright (c) Anthropic PBC. All rights reserved.\\nglobalThis.__cc_import_meta_url = require(\"url\").pathToFileURL(__filename).href;\\n'`,
       '--external:bun:*',
       '--allow-overwrite',
       '--log-level=error',
       '--log-limit=0',
+      '--loader:.md=text',
+      '--loader:.txt=text',
       '--sourcemap',
     ].join(' '), {
-      cwd: ROOT,
+      cwd: BUILD,
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: true,
     }).stderr?.toString() || ''
@@ -173,17 +300,11 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
   }
 
   // Parse missing modules
-  const missingRe = /Could not resolve "([^"]+)"/g
-  const missing = new Set()
-  let m
-  while ((m = missingRe.exec(esbuildOutput)) !== null) {
-    const mod = m[1]
-    if (!mod.startsWith('node:') && !mod.startsWith('bun:') && !mod.startsWith('/')) {
-      missing.add(mod)
-    }
-  }
+  const missing = parseMissingImports(esbuildOutput).filter(({ mod }) =>
+    !mod.startsWith('node:') && !mod.startsWith('bun:')
+  )
 
-  if (missing.size === 0) {
+  if (missing.length === 0) {
     // No more missing modules but still errors — check what
     const errLines = esbuildOutput.split('\n').filter(l => l.includes('ERROR')).slice(0, 5)
     console.log('❌ Unrecoverable errors:')
@@ -191,37 +312,44 @@ for (let round = 1; round <= MAX_ROUNDS; round++) {
     break
   }
 
-  console.log(`   Found ${missing.size} missing modules, creating stubs...`)
+  console.log(`   Found ${missing.length} missing modules, creating stubs...`)
 
   // Create stubs
   let stubCount = 0
-  for (const mod of missing) {
-    // Resolve relative path from the file that imports it — but since we
-    // don't have that info easily, create stubs at multiple likely locations
-    const cleanMod = mod.replace(/^\.\//, '')
+  for (const { mod, importer } of missing) {
+    if (!importer) continue
+
+    const importerPath = importer.startsWith(BUILD)
+      ? importer
+      : resolvePath(BUILD, importer)
+    const target = mod.startsWith('.')
+      ? resolvePath(dirname(importerPath), mod)
+      : resolveBareModuleStubTarget(mod)
+
+    if (!target.startsWith(BUILD)) continue
+    let resolvedTarget = target
+    let ext = extname(resolvedTarget)
+    if (!ext && !mod.startsWith('.')) {
+      resolvedTarget = `${resolvedTarget}.js`
+      ext = '.js'
+    }
 
     // Text assets → empty file
-    if (/\.(txt|md|json)$/.test(cleanMod)) {
-      const p = join(BUILD, 'src', cleanMod)
-      await mkdir(dirname(p), { recursive: true }).catch(() => {})
-      if (!await exists(p)) {
-        await writeFile(p, cleanMod.endsWith('.json') ? '{}' : '', 'utf8')
+    if (['.txt', '.md', '.json'].includes(ext)) {
+      await mkdir(dirname(resolvedTarget), { recursive: true }).catch(() => {})
+      if (!await exists(resolvedTarget)) {
+        await writeFile(resolvedTarget, ext === '.json' ? '{}' : '', 'utf8')
         stubCount++
       }
       continue
     }
 
     // JS/TS modules → export empty
-    if (/\.[tj]sx?$/.test(cleanMod)) {
-      for (const base of [join(BUILD, 'src'), join(BUILD, 'src', 'src')]) {
-        const p = join(base, cleanMod)
-        await mkdir(dirname(p), { recursive: true }).catch(() => {})
-        if (!await exists(p)) {
-          const name = cleanMod.split('/').pop().replace(/\.[tj]sx?$/, '')
-          const safeName = name.replace(/[^a-zA-Z0-9_$]/g, '_') || 'stub'
-          await writeFile(p, `// Auto-generated stub\nexport default function ${safeName}() {}\nexport const ${safeName} = () => {}\n`, 'utf8')
-          stubCount++
-        }
+    if (['.js', '.jsx', '.ts', '.tsx'].includes(ext)) {
+      await mkdir(dirname(resolvedTarget), { recursive: true }).catch(() => {})
+      if (!await exists(resolvedTarget)) {
+        await writeFile(resolvedTarget, makeStubSource(mod), 'utf8')
+        stubCount++
       }
     }
   }
